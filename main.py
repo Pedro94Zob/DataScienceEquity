@@ -287,3 +287,161 @@ print(f"\nTrade-level construit : {len(trade_level)} ordres, {len(trade_level.co
 
 trade_level.to_excel("trade_level_results.xlsx", index=False)
 print("Export trade_level_results.xlsx OK")
+
+# =============================================================================
+# ÉTAPE 3 — ANALYSES DESCRIPTIVES
+# Export dans analyse_descriptive.xlsx (un onglet par analyse)
+# =============================================================================
+
+print("\n=== Analyses descriptives ===")
+
+# On va construire chaque onglet puis tout exporter d'un coup
+onglets = {}
+
+# ---- 1. Stats générales ----
+# Vue d'ensemble des variables clés : ordres de grandeur, dispersion, outliers
+cols_stats = [
+    'WAvg_PnL_bps_VS_Fartouch', 'WAvg_PnL_bps_VS_Mid',
+    'WAvg_Spread_Capture_Cont', 'WAvg_Perf_vs_Spread_Cont', 'WAvg_Spread_Bps_Cont',
+    'Duration_Seconds', 'Num_Fills', 'Total_Exec_Qty',
+    'Aggressive_Ratio', 'Passive_Ratio', 'Neutral_Ratio',
+    'SI_Ratio', 'Dark_Ratio', 'Lit_Ratio',
+    'Num_Brokers', 'Broker_Max_Share',
+    'Pct_Volume_Continuous', 'Pct_Volume_Auction',
+]
+onglets['Stats_Generales'] = trade_level[cols_stats].describe().T
+print("  Stats générales OK")
+
+# ---- 2. Par broker ----
+# Pour chaque broker : combien d'ordres il traite, son volume, sa performance,
+# et son style d'exécution (agressif ou passif).
+# Permet de comparer les brokers entre eux et détecter les plus/moins performants.
+# On travaille au niveau fill pour avoir le vrai broker de chaque fill.
+broker_stats = df.groupby('Broker Name').agg(
+    Nb_Fills=('Fill Id', 'count'),
+    Nb_Orders=('Order Id', 'nunique'),
+    Total_Volume=('Exec Qty', 'sum'),
+    Avg_PnL_Fartouch=('P&L Bps vs Fartouch', 'mean'),
+    Avg_PnL_Mid=('P&L Bps vs Mid', 'mean'),
+    Avg_Spread_Capture=('Spread Capture', 'mean'),
+).sort_values('Total_Volume', ascending=False)
+onglets['Par_Broker'] = broker_stats
+print("  Par broker OK")
+
+# ---- 3. Par venue category ----
+# Pour chaque type de venue : volume, PnL, spread capture.
+# Permet de voir si certains types de venue sont structurellement plus coûteux.
+venue_stats = df.groupby('Venue Category').agg(
+    Nb_Fills=('Fill Id', 'count'),
+    Total_Volume=('Exec Qty', 'sum'),
+    Avg_PnL_Fartouch=('P&L Bps vs Fartouch', 'mean'),
+    Avg_PnL_Mid=('P&L Bps vs Mid', 'mean'),
+    Avg_Spread_Capture=('Spread Capture', 'mean'),
+    Avg_Spread_Bps=('Spread Bps', 'mean'),
+).sort_values('Total_Volume', ascending=False)
+onglets['Par_Venue'] = venue_stats
+print("  Par venue OK")
+
+# ---- 4. Par bucket d'agressivité ----
+# On découpe les ordres en 4 groupes selon leur taux d'agressivité.
+# But : quantifier le coût de l'agressivité sur la performance.
+# Est-ce que plus agressif = pire PnL ? Ou est-ce compensé par moins de slippage ?
+trade_level['Bucket_Agressivite'] = pd.cut(
+    trade_level['Aggressive_Ratio'],
+    bins=[0, 0.25, 0.50, 0.75, 1.0],
+    labels=['0-25%', '25-50%', '50-75%', '75-100%'],
+    include_lowest=True
+)
+bucket_agg = trade_level.groupby('Bucket_Agressivite', observed=False).agg(
+    Nb_Ordres=('Order Id', 'count'),
+    Avg_PnL_Fartouch=('WAvg_PnL_bps_VS_Fartouch', 'mean'),
+    Avg_PnL_Mid=('WAvg_PnL_bps_VS_Mid', 'mean'),
+    Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
+    Avg_Duration_s=('Duration_Seconds', 'mean'),
+    Avg_Num_Fills=('Num_Fills', 'mean'),
+)
+onglets['Par_Bucket_Agressivite'] = bucket_agg
+print("  Par bucket agressivité OK")
+
+# ---- 5. Par bucket de durée ----
+# On découpe les ordres selon leur durée d'exécution.
+# But : voir si les ordres patients (longs) ont une meilleure performance,
+# ou s'ils subissent plus d'adverse selection (le marché bouge contre eux).
+percentiles_duree = trade_level['Duration_Seconds'].quantile([0, 0.25, 0.5, 0.75, 1.0]).values
+trade_level['Bucket_Duree'] = pd.cut(
+    trade_level['Duration_Seconds'],
+    bins=percentiles_duree,
+    labels=['Court (Q1)', 'Moyen-Court (Q2)', 'Moyen-Long (Q3)', 'Long (Q4)'],
+    include_lowest=True
+)
+bucket_duree = trade_level.groupby('Bucket_Duree', observed=False).agg(
+    Nb_Ordres=('Order Id', 'count'),
+    Avg_PnL_Fartouch=('WAvg_PnL_bps_VS_Fartouch', 'mean'),
+    Avg_PnL_Mid=('WAvg_PnL_bps_VS_Mid', 'mean'),
+    Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
+    Avg_Aggressive_Ratio=('Aggressive_Ratio', 'mean'),
+    Avg_Num_Fills=('Num_Fills', 'mean'),
+)
+onglets['Par_Bucket_Duree'] = bucket_duree
+print("  Par bucket durée OK")
+
+# ---- 6. Par venue dominante ----
+# On identifie le type de venue qui a reçu le plus de volume pour chaque ordre.
+# But : comparer la performance des ordres selon leur canal d'exécution principal.
+venue_cols = ['SI_Ratio', 'Dark_Ratio', 'Lit_Ratio', 'Primary_Ratio', 'Auction_Ratio', 'OTC_Ratio']
+trade_level['Venue_Dominante'] = trade_level[venue_cols].idxmax(axis=1).str.replace('_Ratio', '')
+bucket_venue = trade_level.groupby('Venue_Dominante', observed=False).agg(
+    Nb_Ordres=('Order Id', 'count'),
+    Avg_PnL_Fartouch=('WAvg_PnL_bps_VS_Fartouch', 'mean'),
+    Avg_PnL_Mid=('WAvg_PnL_bps_VS_Mid', 'mean'),
+    Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
+    Avg_Aggressive_Ratio=('Aggressive_Ratio', 'mean'),
+).sort_values('Nb_Ordres', ascending=False)
+onglets['Par_Venue_Dominante'] = bucket_venue
+print("  Par venue dominante OK")
+
+# ---- 7. Broker × Agressivité ----
+# Pour chaque broker : son taux d'agressivité pondéré par volume, et le PnL associé.
+# But : répondre à "ce broker est-il cher PARCE QU'il est agressif ?"
+# Si un broker est très agressif ET a un bon PnL, il est efficace.
+# Si un broker est passif ET a un mauvais PnL, il y a un problème.
+broker_agg = df.groupby('Broker Name').apply(
+    lambda x: pd.Series({
+        'Nb_Fills': len(x),
+        'Total_Volume': x['Exec Qty'].sum(),
+        'Aggressive_Ratio': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
+        'Passive_Ratio': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
+        'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
+        'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
+        'Avg_Spread_Capture': x['Spread Capture'].mean(),
+    })
+).sort_values('Total_Volume', ascending=False)
+onglets['Broker_Agressivite'] = broker_agg
+print("  Broker × Agressivité OK")
+
+# ---- 8. Venue × Agressivité ----
+# Pour chaque type de venue : taux d'agressivité et PnL.
+# But : certaines venues forcent-elles un style d'exécution ?
+# Ex: sur un SI, l'exécution est souvent passive (le SI propose un prix).
+# Sur un Lit, on peut être agressif ou passif selon la stratégie.
+venue_agg = df.groupby('Venue Category').apply(
+    lambda x: pd.Series({
+        'Nb_Fills': len(x),
+        'Total_Volume': x['Exec Qty'].sum(),
+        'Aggressive_Ratio': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
+        'Passive_Ratio': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
+        'Neutral_Ratio': (x['Aggressive Passive Flag'] == 'Neutral').sum() / len(x),
+        'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
+        'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
+        'Avg_Spread_Capture': x['Spread Capture'].mean(),
+    })
+).sort_values('Total_Volume', ascending=False)
+onglets['Venue_Agressivite'] = venue_agg
+print("  Venue × Agressivité OK")
+
+# ---- Export multi-onglets ----
+with pd.ExcelWriter("analyse_descriptive.xlsx", engine="openpyxl") as writer:
+    for nom_onglet, dataframe in onglets.items():
+        dataframe.to_excel(writer, sheet_name=nom_onglet)
+
+print("\nExport analyse_descriptive.xlsx OK (8 onglets)")
