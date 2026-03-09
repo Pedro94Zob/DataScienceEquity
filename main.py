@@ -291,11 +291,20 @@ print("Export trade_level_results.xlsx OK")
 # =============================================================================
 # ÉTAPE 3 — ANALYSES DESCRIPTIVES
 # Export dans analyse_descriptive.xlsx (un onglet par analyse)
+# Chaque onglet contient les moyennes pondérées (par Exec Qty) ET simples
+# pour pouvoir comparer les deux approches.
 # =============================================================================
 
 print("\n=== Analyses descriptives ===")
 
-# On va construire chaque onglet puis tout exporter d'un coup
+# Fonction utilitaire : moyenne pondérée par Exec Qty au niveau fill
+def wavg_fill(group, col, poids='Exec Qty'):
+    """Moyenne pondérée d'une colonne par Exec Qty, en ignorant les NaN."""
+    valid = group[[col, poids]].dropna()
+    if valid[poids].sum() > 0:
+        return (valid[col] * valid[poids]).sum() / valid[poids].sum()
+    return np.nan
+
 onglets = {}
 
 # ---- 1. Stats générales ----
@@ -313,31 +322,44 @@ onglets['Stats_Generales'] = trade_level[cols_stats].describe().T
 print("  Stats générales OK")
 
 # ---- 2. Par broker ----
-# Pour chaque broker : combien d'ordres il traite, son volume, sa performance,
-# et son style d'exécution (agressif ou passif).
-# Permet de comparer les brokers entre eux et détecter les plus/moins performants.
-# On travaille au niveau fill pour avoir le vrai broker de chaque fill.
-broker_stats = df.groupby('Broker Name').agg(
-    Nb_Fills=('Fill Id', 'count'),
-    Nb_Orders=('Order Id', 'nunique'),
-    Total_Volume=('Exec Qty', 'sum'),
-    Avg_PnL_Fartouch=('P&L Bps vs Fartouch', 'mean'),
-    Avg_PnL_Mid=('P&L Bps vs Mid', 'mean'),
-    Avg_Spread_Capture=('Spread Capture', 'mean'),
+# Pour chaque broker : volume, performance pondérée et simple, style d'exécution.
+# Pondéré = coût réel par action exécutée. Simple = moyenne par fill (pour comparaison).
+broker_stats = df.groupby('Broker Name').apply(
+    lambda x: pd.Series({
+        'Nb_Fills': len(x),
+        'Nb_Orders': x['Order Id'].nunique(),
+        'Total_Volume': x['Exec Qty'].sum(),
+        # Pondéré par Exec Qty (métrique principale)
+        'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
+        'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
+        'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
+        # Non pondéré (pour comparaison)
+        'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
+        'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
+        'Avg_Spread_Capture': x['Spread Capture'].mean(),
+    })
 ).sort_values('Total_Volume', ascending=False)
 onglets['Par_Broker'] = broker_stats
 print("  Par broker OK")
 
 # ---- 3. Par venue category ----
-# Pour chaque type de venue : volume, PnL, spread capture.
+# Pour chaque type de venue : volume, PnL, spread capture (pondéré + simple).
 # Permet de voir si certains types de venue sont structurellement plus coûteux.
-venue_stats = df.groupby('Venue Category').agg(
-    Nb_Fills=('Fill Id', 'count'),
-    Total_Volume=('Exec Qty', 'sum'),
-    Avg_PnL_Fartouch=('P&L Bps vs Fartouch', 'mean'),
-    Avg_PnL_Mid=('P&L Bps vs Mid', 'mean'),
-    Avg_Spread_Capture=('Spread Capture', 'mean'),
-    Avg_Spread_Bps=('Spread Bps', 'mean'),
+venue_stats = df.groupby('Venue Category').apply(
+    lambda x: pd.Series({
+        'Nb_Fills': len(x),
+        'Total_Volume': x['Exec Qty'].sum(),
+        # Pondéré
+        'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
+        'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
+        'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
+        'W_Spread_Bps': wavg_fill(x, 'Spread Bps'),
+        # Non pondéré
+        'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
+        'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
+        'Avg_Spread_Capture': x['Spread Capture'].mean(),
+        'Avg_Spread_Bps': x['Spread Bps'].mean(),
+    })
 ).sort_values('Total_Volume', ascending=False)
 onglets['Par_Venue'] = venue_stats
 print("  Par venue OK")
@@ -364,15 +386,14 @@ onglets['Par_Bucket_Agressivite'] = bucket_agg
 print("  Par bucket agressivité OK")
 
 # ---- 5. Par bucket de durée ----
-# On découpe les ordres selon leur durée d'exécution.
+# On découpe les ordres selon leur durée d'exécution avec des bornes fixes.
 # But : voir si les ordres patients (longs) ont une meilleure performance,
 # ou s'ils subissent plus d'adverse selection (le marché bouge contre eux).
-percentiles_duree = trade_level['Duration_Seconds'].quantile([0, 0.25, 0.5, 0.75, 1.0]).values
+# Note : beaucoup d'ordres ont durée = 0 (1 seul fill), on les isole.
 trade_level['Bucket_Duree'] = pd.cut(
     trade_level['Duration_Seconds'],
-    bins=percentiles_duree,
-    labels=['Court (Q1)', 'Moyen-Court (Q2)', 'Moyen-Long (Q3)', 'Long (Q4)'],
-    include_lowest=True
+    bins=[-0.001, 0, 60, 600, 3600, trade_level['Duration_Seconds'].max() + 1],
+    labels=['Instantané (0s)', 'Très court (<1min)', 'Court (1-10min)', 'Moyen (10-60min)', 'Long (>1h)'],
 )
 bucket_duree = trade_level.groupby('Bucket_Duree', observed=False).agg(
     Nb_Ordres=('Order Id', 'count'),
@@ -409,8 +430,16 @@ broker_agg = df.groupby('Broker Name').apply(
     lambda x: pd.Series({
         'Nb_Fills': len(x),
         'Total_Volume': x['Exec Qty'].sum(),
-        'Aggressive_Ratio': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
-        'Passive_Ratio': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
+        # Ratios pondérés par volume (combien de volume est agressif/passif)
+        'W_Aggressive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Aggressive', 'Exec Qty'].sum()) / x['Exec Qty'].sum() if x['Exec Qty'].sum() > 0 else 0,
+        'W_Passive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Passive', 'Exec Qty'].sum()) / x['Exec Qty'].sum() if x['Exec Qty'].sum() > 0 else 0,
+        # Ratios simples (en nombre de fills, pour comparaison)
+        'Aggressive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
+        'Passive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
+        # PnL pondéré + simple
+        'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
+        'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
+        'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
         'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
         'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
         'Avg_Spread_Capture': x['Spread Capture'].mean(),
@@ -420,7 +449,7 @@ onglets['Broker_Agressivite'] = broker_agg
 print("  Broker × Agressivité OK")
 
 # ---- 8. Venue × Agressivité ----
-# Pour chaque type de venue : taux d'agressivité et PnL.
+# Pour chaque type de venue : taux d'agressivité et PnL (pondéré + simple).
 # But : certaines venues forcent-elles un style d'exécution ?
 # Ex: sur un SI, l'exécution est souvent passive (le SI propose un prix).
 # Sur un Lit, on peut être agressif ou passif selon la stratégie.
@@ -428,9 +457,18 @@ venue_agg = df.groupby('Venue Category').apply(
     lambda x: pd.Series({
         'Nb_Fills': len(x),
         'Total_Volume': x['Exec Qty'].sum(),
-        'Aggressive_Ratio': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
-        'Passive_Ratio': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
-        'Neutral_Ratio': (x['Aggressive Passive Flag'] == 'Neutral').sum() / len(x),
+        # Ratios pondérés par volume
+        'W_Aggressive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Aggressive', 'Exec Qty'].sum()) / x['Exec Qty'].sum() if x['Exec Qty'].sum() > 0 else 0,
+        'W_Passive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Passive', 'Exec Qty'].sum()) / x['Exec Qty'].sum() if x['Exec Qty'].sum() > 0 else 0,
+        'W_Neutral_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Neutral', 'Exec Qty'].sum()) / x['Exec Qty'].sum() if x['Exec Qty'].sum() > 0 else 0,
+        # Ratios simples
+        'Aggressive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
+        'Passive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
+        'Neutral_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Neutral').sum() / len(x),
+        # PnL pondéré + simple
+        'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
+        'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
+        'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
         'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
         'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
         'Avg_Spread_Capture': x['Spread Capture'].mean(),
