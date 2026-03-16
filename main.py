@@ -151,8 +151,7 @@ def wavg(group, col, poids='Poids_EUR'):
 
 def build_segments(g, group_col):
     """Regroupe les fills consécutifs ayant la même valeur de group_col en segments.
-    Retourne une liste de dicts avec label, start, end, gross, aggr_qty, total_qty,
-    nb_good, nb_bad, nb_neutral."""
+    Retourne une liste de dicts avec toutes les infos nécessaires pour timeline + plot."""
     g_sorted = g.sort_values('Exec Timestamp (UTC)')
 
     segments = []
@@ -161,10 +160,35 @@ def build_segments(g, group_col):
     current_end = None
     current_gross = 0
     current_aggr_qty = 0
+    current_passive_qty = 0
     current_total_qty = 0
     current_good = 0
     current_bad = 0
     current_neutral = 0
+    current_n_fills = 0
+    current_pnl_sum = 0       # somme PnL € vs Mid pour wavg
+    current_pnl_poids = 0     # somme Poids_EUR des fills avec PnL non-NaN
+    current_brokers = {}      # broker_name -> Poids_EUR cumulé
+
+    def flush_segment():
+        """Sauvegarde le segment courant."""
+        # PnL moyen pondéré du segment
+        seg_pnl_mid = current_pnl_sum / current_pnl_poids if current_pnl_poids > 0 else np.nan
+        segments.append({
+            'label': current_val,
+            'start': current_start,
+            'end': current_end,
+            'gross': current_gross,
+            'aggr_qty': current_aggr_qty,
+            'passive_qty': current_passive_qty,
+            'total_qty': current_total_qty,
+            'nb_fills': current_n_fills,
+            'nb_good': current_good,
+            'nb_bad': current_bad,
+            'nb_neutral': current_neutral,
+            'pnl_mid_wavg': seg_pnl_mid,
+            'brokers': dict(current_brokers),
+        })
 
     for _, row in g_sorted.iterrows():
         val = row[group_col]
@@ -173,54 +197,52 @@ def build_segments(g, group_col):
 
         if val != current_val:
             if current_val is not None:
-                segments.append({
-                    'label': current_val,
-                    'start': current_start,
-                    'end': current_end,
-                    'gross': current_gross,
-                    'aggr_qty': current_aggr_qty,
-                    'total_qty': current_total_qty,
-                    'nb_good': current_good,
-                    'nb_bad': current_bad,
-                    'nb_neutral': current_neutral,
-                })
+                flush_segment()
             current_val = val
             current_start = row['Exec Timestamp (UTC)']
             current_gross = 0
             current_aggr_qty = 0
+            current_passive_qty = 0
             current_total_qty = 0
             current_good = 0
             current_bad = 0
             current_neutral = 0
+            current_n_fills = 0
+            current_pnl_sum = 0
+            current_pnl_poids = 0
+            current_brokers = {}
 
         current_end = row['Exec Timestamp (UTC)']
-        current_gross += row['Poids_EUR'] if pd.notna(row['Poids_EUR']) else 0
+        poids = row['Poids_EUR'] if pd.notna(row['Poids_EUR']) else 0
+        current_gross += poids
         qty = row['Exec Qty'] if pd.notna(row['Exec Qty']) else 0
         current_total_qty += qty
-        if row.get('Aggressive Passive Flag') == 'Aggressive':
-            current_aggr_qty += qty
+        current_n_fills += 1
 
-        pnl = row['P&L Bps vs Mid']
-        if pd.notna(pnl):
-            if pnl > 0:
+        flag = row.get('Aggressive Passive Flag', '')
+        if flag == 'Aggressive':
+            current_aggr_qty += qty
+        elif flag == 'Passive':
+            current_passive_qty += qty
+
+        pnl_bps = row['P&L Bps vs Mid']
+        if pd.notna(pnl_bps):
+            current_pnl_sum += pnl_bps * poids
+            current_pnl_poids += poids
+            if pnl_bps > 0:
                 current_good += 1
-            elif pnl < 0:
+            elif pnl_bps < 0:
                 current_bad += 1
             else:
                 current_neutral += 1
 
+        broker = row.get('Broker Name', 'Unknown')
+        if pd.isna(broker):
+            broker = 'Unknown'
+        current_brokers[broker] = current_brokers.get(broker, 0) + poids
+
     if current_val is not None:
-        segments.append({
-            'label': current_val,
-            'start': current_start,
-            'end': current_end,
-            'gross': current_gross,
-            'aggr_qty': current_aggr_qty,
-            'total_qty': current_total_qty,
-            'nb_good': current_good,
-            'nb_bad': current_bad,
-            'nb_neutral': current_neutral,
-        })
+        flush_segment()
 
     return segments
 
@@ -260,19 +282,35 @@ VENUE_COLORS = {
     'Unknown': '#bdc3c7',                        # gris clair
 }
 
-# Couleurs par broker (palette auto)
-BROKER_CMAP = plt.cm.get_cmap('tab20')
+# Noms courts pour l'affichage
+VENUE_SHORT = {
+    'SI - Systematic Internaliser': 'SI',
+    'Primary Exchange': 'Primary',
+    'Periodic Auction (Lit)': 'Auction',
+}
+
+def format_gross(val):
+    """Formate un montant en k€ ou M€ lisible."""
+    if val >= 1_000_000:
+        return f"{val / 1_000_000:.1f}M€"
+    elif val >= 1_000:
+        return f"{val / 1_000:.0f}k€"
+    else:
+        return f"{val:.0f}€"
 
 def plot_order_timeline(df, order_id=None):
-    """Trace la timeline d'un ordre : blocs par venue (haut) et par broker (bas).
+    """Trace la timeline d'un ordre : une rangée de blocs par venue, avec toutes les infos.
 
-    Chaque bloc montre :
-    - Le type de venue ou le broker
-    - Le % du volume (Gross Amount €)
-    - Le ratio d'agressivité
-    - Le ratio Good/Bad fills
+    Chaque bloc = un segment de venue consécutif, contenant :
+    - Nom de la venue, nb de fills
+    - Gross Amount € + % du trade total
+    - Brokers impliqués (avec % chacun)
+    - Ratio d'agressivité / passivité
+    - Ratio Good / Bad fills
+    - PnL moyen pondéré vs Mid
 
-    Appeler avec un Order Id valide. Si None, ne fait rien.
+    Axe X = timestamps réels. Largeur proportionnelle au temps.
+    Si order_id=None, ne fait rien.
     """
     if order_id is None:
         return
@@ -287,89 +325,108 @@ def plot_order_timeline(df, order_id=None):
     instrument = fills['Instrument Name'].iloc[0]
     isin = fills['ISIN'].iloc[0]
     n_fills = len(fills)
+    total_gross_order = fills['Poids_EUR'].sum()
 
-    # Segments venue et broker
+    # Segments par venue
     venue_segs = build_segments(fills, 'Venue Category')
-    broker_segs = build_segments(fills, 'Broker Name')
 
-    # Timestamp de référence = premier fill
+    # Timestamps de référence
     t0 = fills['Exec Timestamp (UTC)'].min()
+    t_end_order = fills['Exec Timestamp (UTC)'].max()
+    total_duration_s = max((t_end_order - t0).total_seconds(), 1)
 
-    # Durée totale en minutes (au moins 1 min pour affichage)
-    total_duration_min = max((fills['Exec Timestamp (UTC)'].max() - t0).total_seconds() / 60, 1)
+    # --- Calcul des positions X en timestamps réels ---
+    # On utilise les timestamps directement (pas des minutes relatives)
+    fig, ax = plt.subplots(figsize=(18, 5))
 
-    def seg_to_bar(seg, t0):
-        """Convertit un segment en (x_start_min, width_min) depuis t0."""
-        start_min = (seg['start'] - t0).total_seconds() / 60
-        end_min = (seg['end'] - t0).total_seconds() / 60
-        width = max(end_min - start_min, total_duration_min * 0.02)  # largeur min 2% pour visibilité
-        return start_min, width
+    fig.suptitle(
+        f"{side} {instrument} ({isin}) — Order {order_id} — {n_fills} fills — {format_gross(total_gross_order)} total",
+        fontsize=13, fontweight='bold', y=0.98
+    )
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
-    fig.suptitle(f"{side} {instrument} ({isin}) — Order {order_id} — {n_fills} fills",
-                 fontsize=13, fontweight='bold')
+    bar_height = 0.8
+    n_segs = len(venue_segs)
 
-    total_gross_venue = sum(s['gross'] for s in venue_segs)
-    total_gross_broker = sum(s['gross'] for s in broker_segs)
+    for i, seg in enumerate(venue_segs):
+        # Position X : secondes depuis t0
+        x_start = (seg['start'] - t0).total_seconds()
+        x_end = (seg['end'] - t0).total_seconds()
+        width = max(x_end - x_start, total_duration_s * 0.03)  # min 3% pour visibilité
 
-    # --- Ligne 1 : Blocs par Venue ---
-    for seg in venue_segs:
-        x, w = seg_to_bar(seg, t0)
+        # Couleur par venue
         color = VENUE_COLORS.get(seg['label'], '#bdc3c7')
-        ax1.barh(0, w, left=x, height=0.8, color=color, edgecolor='white', linewidth=1.5)
+        ax.barh(0, width, left=x_start, height=bar_height, color=color,
+                edgecolor='white', linewidth=2, alpha=0.9)
 
-        # Texte dans le bloc
-        pct = seg['gross'] / total_gross_venue * 100 if total_gross_venue > 0 else 0
-        aggr = seg['aggr_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
-        n_seg = seg['nb_good'] + seg['nb_bad'] + seg['nb_neutral']
-        good_r = seg['nb_good'] / n_seg * 100 if n_seg > 0 else 0
-        bad_r = seg['nb_bad'] / n_seg * 100 if n_seg > 0 else 0
+        # --- Texte dans le bloc ---
+        label_short = VENUE_SHORT.get(seg['label'], seg['label'])
 
-        # Label court pour le venue
-        label_short = seg['label'].replace('SI - Systematic Internaliser', 'SI') \
-                                   .replace('Primary Exchange', 'Primary') \
-                                   .replace('Periodic Auction (Lit)', 'Auction')
+        # % du trade total
+        pct_trade = seg['gross'] / total_gross_order * 100 if total_gross_order > 0 else 0
 
-        txt = f"{label_short}\n{pct:.0f}%\nAggr:{aggr:.0f}%\nG:{good_r:.0f}% B:{bad_r:.0f}%"
-        ax1.text(x + w / 2, 0, txt, ha='center', va='center', fontsize=7,
-                 fontweight='bold', color='white')
+        # Brokers : top brokers avec %
+        total_seg_gross = seg['gross']
+        broker_strs = []
+        for bk, bk_gross in sorted(seg['brokers'].items(), key=lambda x: -x[1]):
+            bk_pct = bk_gross / total_seg_gross * 100 if total_seg_gross > 0 else 0
+            broker_strs.append(f"{bk} {bk_pct:.0f}%")
+        brokers_txt = " / ".join(broker_strs[:3])  # max 3 brokers affichés
 
-    ax1.set_yticks([])
-    ax1.set_ylabel('Venue', fontsize=11, fontweight='bold')
-    ax1.set_ylim(-0.5, 0.5)
+        # Agressivité
+        aggr_pct = seg['aggr_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
+        pass_pct = seg['passive_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
 
-    # --- Ligne 2 : Blocs par Broker ---
-    broker_names = list({s['label'] for s in broker_segs})
-    broker_color_map = {name: BROKER_CMAP(i / max(len(broker_names), 1))
-                        for i, name in enumerate(broker_names)}
+        # Good / Bad
+        n_quality = seg['nb_good'] + seg['nb_bad'] + seg['nb_neutral']
+        good_r = seg['nb_good'] / n_quality * 100 if n_quality > 0 else 0
+        bad_r = seg['nb_bad'] / n_quality * 100 if n_quality > 0 else 0
 
-    for seg in broker_segs:
-        x, w = seg_to_bar(seg, t0)
-        color = broker_color_map.get(seg['label'], '#bdc3c7')
-        ax2.barh(0, w, left=x, height=0.8, color=color, edgecolor='white', linewidth=1.5)
+        # PnL
+        pnl_txt = f"{seg['pnl_mid_wavg']:+.1f}bps" if pd.notna(seg['pnl_mid_wavg']) else "N/A"
 
-        pct = seg['gross'] / total_gross_broker * 100 if total_gross_broker > 0 else 0
-        aggr = seg['aggr_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
-        n_seg = seg['nb_good'] + seg['nb_bad'] + seg['nb_neutral']
-        good_r = seg['nb_good'] / n_seg * 100 if n_seg > 0 else 0
-        bad_r = seg['nb_bad'] / n_seg * 100 if n_seg > 0 else 0
+        # Assemblage du texte
+        txt = (
+            f"{label_short}\n"
+            f"{seg['nb_fills']} fills\n"
+            f"{format_gross(seg['gross'])} ({pct_trade:.0f}%)\n"
+            f"{brokers_txt}\n"
+            f"Aggr:{aggr_pct:.0f}% Pas:{pass_pct:.0f}%\n"
+            f"G:{good_r:.0f}% B:{bad_r:.0f}%\n"
+            f"PnL Mid: {pnl_txt}"
+        )
 
-        txt = f"{seg['label']}\n{pct:.0f}%\nAggr:{aggr:.0f}%\nG:{good_r:.0f}% B:{bad_r:.0f}%"
-        ax2.text(x + w / 2, 0, txt, ha='center', va='center', fontsize=7,
-                 fontweight='bold', color='white')
+        # Taille de police adaptée à la largeur du bloc
+        fontsize = 7 if width / total_duration_s > 0.15 else 6
+        ax.text(x_start + width / 2, 0, txt, ha='center', va='center',
+                fontsize=fontsize, fontweight='bold', color='white',
+                linespacing=1.3)
 
-    ax2.set_yticks([])
-    ax2.set_ylabel('Broker', fontsize=11, fontweight='bold')
-    ax2.set_ylim(-0.5, 0.5)
-    ax2.set_xlabel('Minutes depuis le 1er fill', fontsize=10)
+        # Heure sous le bloc
+        t_label = seg['start'].strftime('%H:%M:%S') if pd.notna(seg['start']) else '?'
+        ax.text(x_start, -bar_height / 2 - 0.08, t_label, ha='left', va='top',
+                fontsize=7, color='#333333', rotation=0)
+
+    # Heure de fin du dernier segment
+    last_end = venue_segs[-1]['end']
+    if pd.notna(last_end):
+        x_last = (last_end - t0).total_seconds()
+        ax.text(x_last, -bar_height / 2 - 0.08, last_end.strftime('%H:%M:%S'),
+                ha='right', va='top', fontsize=7, color='#333333')
+
+    # Mise en forme
+    ax.set_yticks([])
+    ax.set_ylim(-0.7, 0.7)
+    ax.set_xlabel('Temps (secondes depuis le 1er fill)', fontsize=10)
+    ax.spines['top'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.spines['right'].set_visible(False)
 
     # Légende venue
-    venue_patches = [mpatches.Patch(color=c, label=l.replace('SI - Systematic Internaliser', 'SI')
-                                    .replace('Primary Exchange', 'Primary')
-                                    .replace('Periodic Auction (Lit)', 'Auction'))
+    venue_patches = [mpatches.Patch(color=c, label=VENUE_SHORT.get(l, l))
                      for l, c in VENUE_COLORS.items()
                      if any(s['label'] == l for s in venue_segs)]
-    ax1.legend(handles=venue_patches, loc='upper right', fontsize=7, ncol=2)
+    ax.legend(handles=venue_patches, loc='upper right', fontsize=8, ncol=2,
+              framealpha=0.8)
 
     plt.tight_layout()
     plt.savefig(f"timeline_order_{order_id}.png", dpi=150, bbox_inches='tight')

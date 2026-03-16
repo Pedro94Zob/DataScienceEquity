@@ -1,0 +1,269 @@
+\documentclass[10pt]{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{booktabs}
+\usepackage{adjustbox}
+\usepackage{amsmath}
+
+\title{Analyse TCA -- Equity Execution FY2025}
+\subtitle{Phase 2 : Enrichissements méthodologiques et analyse fill-level}
+\author{Pierre BERTHOLD}
+\date{Mars 2026}
+
+\begin{document}
+
+% =============================================
+\begin{frame}
+\titlepage
+\end{frame}
+
+% =============================================
+\begin{frame}{Sommaire}
+\tableofcontents
+\end{frame}
+
+% =============================================
+\section{Rappel Phase 1}
+
+\begin{frame}{Ce qui existait déjà}
+\textbf{Pipeline Phase 1 :}
+\begin{itemize}
+    \item 89\,142 fills $\rightarrow$ filtre Care/Market + ALGO $\rightarrow$ 1\,754 ordres
+    \item Agrégation fill $\rightarrow$ trade-level (1 ligne = 1 ordre)
+    \item Pondération par \texttt{Exec Qty} (nombre d'actions)
+    \item 8 onglets d'analyses descriptives (broker, venue, agressivité, durée)
+    \item 3 fichiers de sortie séparés
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Limites identifiées :}
+\begin{itemize}
+    \item Pondération par quantité $\neq$ pondération par valeur économique
+    \item Perte de la \textbf{timeline} : on ne savait pas \textit{quand} chaque venue/broker intervenait
+    \item Pas de scoring individuel des fills (good/bad)
+    \item Pas de visualisation de la séquence d'exécution
+\end{itemize}
+\end{frame}
+
+% =============================================
+\section{Changements méthodologiques}
+
+\begin{frame}{Pondération : Exec Qty $\rightarrow$ Gross Amount \euro{}}
+\textbf{Avant :} moyenne pondérée par nombre d'actions (\texttt{Exec Qty}).
+
+\textbf{Maintenant :} moyenne pondérée par \texttt{|Gross Amount \euro{}|} = \texttt{Exec Qty $\times$ Exec Price $\times$ FX Rate}.
+
+\vspace{0.3cm}
+\textbf{Pourquoi ?}
+\begin{itemize}
+    \item Un fill de 100 actions à 500\euro{} (= 50\,000\euro{}) pèse plus qu'un fill de 1\,000 actions à 2\euro{} (= 2\,000\euro{})
+    \item Intègre le prix \textbf{et} le taux de change en une seule métrique
+    \item Reflète le vrai poids économique de chaque fill
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Formule mise à jour :}
+$$\text{WAvg}(X) = \frac{\sum_{i} X_i \times |\text{Gross Amount}_i|}{\sum_{i} |\text{Gross Amount}_i|}$$
+
+\textbf{Impact :} tous les ratios (venue, broker, agressivité, phases) et tous les PnL pondérés utilisent désormais cette pondération.
+\end{frame}
+
+% =============================================
+\begin{frame}{Spread Capture : filtre Continuous strict}
+\textbf{Règle :} le Spread Capture n'est calculé que pour les fills en phase \texttt{Continuous} (8h00--17h00 UTC, hors auctions).
+
+\vspace{0.3cm}
+\textbf{Pourquoi ?}
+\begin{itemize}
+    \item En auction ou hors marché, il n'y a pas de spread bid-ask réel
+    \item Un Spread Capture calculé sans spread n'a pas de sens économique
+    \item Forcer \texttt{NaN} hors Continuous évite de polluer les moyennes
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Application :}
+\begin{itemize}
+    \item Au \textbf{fill-level} : nouvelle colonne \texttt{Spread\_Capture\_Cont} = valeur si Continuous, NaN sinon
+    \item Au \textbf{trade-level} : \texttt{WAvg\_Spread\_Capture\_Cont} calculé uniquement sur les fills Continuous de l'ordre
+\end{itemize}
+\end{frame}
+
+% =============================================
+\section{Nouveautés : analyse fill-level}
+
+\begin{frame}{Enrichissement fill-level}
+\textbf{Nouveau :} chaque fill conserve son identité et reçoit des métriques individuelles.
+
+\vspace{0.3cm}
+\begin{tabular}{lp{7cm}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+Fill\_Rank & Rang chronologique du fill dans l'ordre (1er, 2e, 3e...) \\
+Market\_Phase & Phase de marché au moment du fill \\
+Spread\_Capture\_Cont & Spread Capture si Continuous, NaN sinon \\
+PnL\_Contribution\_Mid & Contribution normalisée au PnL du trade \\
+Fill\_Quality & Good / Bad / Neutral \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+\textbf{Contribution au PnL :}
+$$\text{Contribution}_i = \frac{\text{PnL}_i}{\sum_j |\text{PnL}_j|}$$
+
+Bornée entre $-1$ et $+1$. Un fill à $-0.30$ = ce fill a dégradé le PnL du trade de 30\%.
+\end{frame}
+
+% =============================================
+\begin{frame}{Qualité des fills : Good / Bad / Neutral}
+Chaque fill est classé selon son PnL Bps vs Mid :
+
+\vspace{0.3cm}
+\begin{tabular}{lll}
+\toprule
+\textbf{Classe} & \textbf{Condition} & \textbf{Interprétation} \\
+\midrule
+Good & PnL vs Mid $> 0$ & Exécuté mieux que le mid-spread \\
+Bad & PnL vs Mid $< 0$ & Exécuté moins bien que le mid-spread \\
+Neutral & PnL vs Mid $= 0$ & Exactement au mid \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+\textbf{Au trade-level :} trois ratios remplacent les anciens compteurs :
+\begin{itemize}
+    \item \texttt{Good\_Fill\_Ratio} = \% des fills qui ont amélioré la TCA
+    \item \texttt{Bad\_Fill\_Ratio} = \% des fills qui ont dégradé la TCA
+    \item \texttt{Neutral\_Fill\_Ratio} = \% des fills neutres
+\end{itemize}
+
+\vspace{0.2cm}
+Permet de répondre : \textit{``sur cet ordre, 60\% des fills étaient bons mais les 40\% mauvais pesaient plus lourd en valeur''.}
+\end{frame}
+
+% =============================================
+\section{Nouveautés : timelines}
+
+\begin{frame}{Timeline d'exécution par venue}
+\textbf{Nouveau :} pour chaque ordre, on reconstruit la séquence chronologique des venues.
+
+\vspace{0.3cm}
+\textbf{Format :}
+\begin{center}
+\small
+\texttt{Lit 35\% [Aggr:30\%] (08:12-08:31) $\rightarrow$ SI 50\% [Aggr:95\%] (08:31-09:15) $\rightarrow$ Dark 15\% [Aggr:10\%] (09:15-09:28)}
+\end{center}
+
+\vspace{0.3cm}
+\textbf{Lecture :}
+\begin{itemize}
+    \item \textbf{\%} = part du Gross Amount \euro{} total de l'ordre sur ce segment
+    \item \textbf{Aggr} = ratio d'agressivité du volume sur ce segment
+    \item \textbf{(HH:MM-HH:MM)} = plage horaire du segment
+    \item \textbf{$\rightarrow$} = changement de venue (les fills consécutifs sur la même venue sont regroupés)
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Même format pour les brokers :} \texttt{Timeline\_Broker}.\\
+Permet de répondre : \textit{``ce broker a exécuté en début (prix favorable) ou en fin (marché adverse) ?''}
+\end{frame}
+
+% =============================================
+\begin{frame}{Visualisation matplotlib}
+\textbf{Nouveau :} fonction \texttt{plot\_order\_timeline(df, order\_id)} pour tracer la timeline d'un ordre.
+
+\vspace{0.3cm}
+\textbf{Structure du graphique :}
+\begin{itemize}
+    \item \textbf{Ligne du haut :} blocs colorés par \textbf{type de venue} (SI=rouge, Dark=bleu foncé, Lit=vert, Primary=bleu, Auction=orange)
+    \item \textbf{Ligne du bas :} blocs colorés par \textbf{broker}
+    \item \textbf{Axe X :} minutes depuis le 1er fill
+    \item \textbf{Dans chaque bloc :} nom, \% du volume, ratio d'agressivité, ratio Good/Bad fills
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Usage :}
+\begin{itemize}
+    \item Appeler avec un Order Id $\rightarrow$ génère le plot + sauvegarde PNG
+    \item Si aucun Order Id fourni $\rightarrow$ ne fait rien
+    \item Permet d'illustrer un trade exemple en présentation
+\end{itemize}
+\end{frame}
+
+% =============================================
+\section{Export et structure}
+
+\begin{frame}{Un seul fichier de sortie}
+\textbf{Avant :} 3 fichiers séparés (\texttt{fills\_enriched}, \texttt{trade\_level}, \texttt{analyse\_descriptive}).
+
+\textbf{Maintenant :} un seul fichier \textbf{\texttt{results\_TCA\_Analysis.xlsx}} avec 10 feuilles :
+
+\vspace{0.3cm}
+\begin{tabular}{rlp{6cm}}
+\toprule
+\textbf{\#} & \textbf{Feuille} & \textbf{Contenu} \\
+\midrule
+1 & Fills\_Enriched & 1 ligne = 1 fill, avec rang, contribution, quality \\
+2 & Trade\_Level & 1 ligne = 1 ordre, avec timelines et ratios \\
+3 & Stats\_Generales & describe() sur les variables clés \\
+4 & Par\_Broker & Performance par broker (pondéré + simple) \\
+5 & Par\_Venue & Performance par type de venue \\
+6 & Par\_Bucket\_Agressivite & 4 buckets d'Aggressive\_Ratio \\
+7 & Par\_Bucket\_Duree & 5 buckets de durée d'exécution \\
+8 & Par\_Venue\_Dominante & Performance par venue dominante \\
+9 & Broker\_Agressivite & Croisement broker $\times$ style d'exécution \\
+10 & Venue\_Agressivite & Croisement venue $\times$ style d'exécution \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% =============================================
+\section{Synthèse}
+
+\begin{frame}{Résumé des changements}
+
+\begin{tabular}{lll}
+\toprule
+\textbf{Aspect} & \textbf{Avant} & \textbf{Maintenant} \\
+\midrule
+Pondération & Exec Qty & $|$Gross Amount \euro{}$|$ \\
+Spread Capture & Tous les fills & Continuous uniquement \\
+Granularité & Trade-level seul & Fill-level + Trade-level \\
+Timeline & Absente & Venue + Broker + Aggr \\
+Qualité fills & Absente & Good/Bad/Neutral + ratios \\
+Contribution PnL & Absente & Normalisée $\in [-1, +1]$ \\
+Visualisation & Aucune & Timeline matplotlib \\
+Fichiers sortie & 3 fichiers & 1 fichier, 10 feuilles \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4cm}
+\textbf{Ce qui ne change pas :}
+\begin{itemize}
+    \item Pipeline de chargement, filtre, nettoyage
+    \item Classification Market Phase
+    \item 8 onglets d'analyses descriptives (mêmes axes, pondération mise à jour)
+    \item Les 3 résultats clés de la Phase 1 restent valides
+\end{itemize}
+\end{frame}
+
+% =============================================
+\begin{frame}{Prochaines étapes}
+\textbf{Avec la timeline et le fill-level, on peut maintenant :}
+
+\begin{enumerate}
+    \item \textbf{Analyser la séquence d'exécution :} le broker commence-t-il en Lit puis bascule en SI ? À quel moment ? Est-ce corrélé au mouvement du prix ?
+    \item \textbf{Scorer les brokers fill par fill :} quel broker accumule les ``Bad fills'' ? Est-ce lié à sa stratégie de venue ou à un mauvais timing ?
+    \item \textbf{Contrôler par taille d'ordre (\% ADV) :} vérifier si les écarts persistent à taille comparable
+    \item \textbf{Régression multivariée :} PnL Mid $\sim$ Aggressive\_Ratio + SI\_Ratio + Duration + \% ADV + Broker
+    \item \textbf{Analyse momentum / reversion :} ajouter le rendement du titre sur la journée
+\end{enumerate}
+
+\vspace{0.3cm}
+\textbf{Objectif :} passer de ``ce broker coûte cher'' à ``ce broker coûte cher \textit{parce que} ses fills SI en début de séance sont systématiquement agressifs sur des titres peu liquides''.
+\end{frame}
+
+\end{document}
