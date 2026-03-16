@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.dates import DateFormatter, MinuteLocator
 
 # =============================================================================
 # 1. CHARGEMENT ET NETTOYAGE
@@ -124,29 +127,15 @@ df['PnL_Contribution_Mid'] = df.groupby('Order Id', group_keys=False).apply(
 ).reset_index(drop=True)
 
 # Flag : ce fill a-t-il amélioré (+) ou dégradé (-) la TCA ?
+# Good = exécuté mieux que le mid-spread (PnL > 0)
+# Bad = exécuté moins bien que le mid-spread (PnL < 0)
+# Neutral = exactement au mid (PnL = 0)
 df['Fill_Quality'] = np.where(
     df['P&L Bps vs Mid'] > 0, 'Good',
     np.where(df['P&L Bps vs Mid'] < 0, 'Bad', 'Neutral')
 )
 
-# Export fill-level enrichi
-cols_export_fill = [
-    'Order Id', 'Fill_Rank', 'Nb_Fills_Ordre',
-    'Exec Timestamp (UTC)', 'Market_Phase',
-    'Side', 'ISIN', 'Instrument Name',
-    'Exec Qty', 'Exec Price', 'Exec Ccy', 'Gross Amount €', 'Poids_EUR',
-    'Venue Category', 'Venue (MIC)', 'Venue Name',
-    'Broker Name', 'Broker Group',
-    'Aggressive Passive Flag',
-    'P&L Bps vs Fartouch', 'P&L Bps vs Mid',
-    'P&L € vs Fartouch', 'P&L € vs Mid',
-    'Spread Capture_Cont', 'Spread Bps', '% Perf vs Spread',
-    'PnL_Contribution_Mid', 'Fill_Quality',
-]
-# On ne garde que les colonnes qui existent (au cas où)
-cols_export_fill = [c for c in cols_export_fill if c in df.columns]
-df[cols_export_fill].to_excel("fills_enriched.xlsx", index=False)
-print(f"Export fills_enriched.xlsx OK ({len(df)} fills)")
+print(f"  Fill Quality : {df['Fill_Quality'].value_counts().to_dict()}")
 
 # =============================================================================
 # 6. FONCTIONS UTILITAIRES
@@ -160,15 +149,10 @@ def wavg(group, col, poids='Poids_EUR'):
         return (valid[col] * valid[poids]).sum() / valid[poids].sum()
     return np.nan
 
-def build_timeline(g, group_col):
-    """Construit une timeline lisible pour un groupe de fills triés par timestamp.
-
-    Regroupe les fills consécutifs ayant la même valeur de group_col en segments.
-    Format : "Lit 35% [Aggr:30%] (08:12–08:31) → SI 50% [Aggr:95%] (08:31–09:15)"
-
-    Le % = part du Gross Amount € total du trade sur ce segment.
-    Aggr = part du volume agressif sur ce segment.
-    """
+def build_segments(g, group_col):
+    """Regroupe les fills consécutifs ayant la même valeur de group_col en segments.
+    Retourne une liste de dicts avec label, start, end, gross, aggr_qty, total_qty,
+    nb_good, nb_bad, nb_neutral."""
     g_sorted = g.sort_values('Exec Timestamp (UTC)')
 
     segments = []
@@ -178,6 +162,9 @@ def build_timeline(g, group_col):
     current_gross = 0
     current_aggr_qty = 0
     current_total_qty = 0
+    current_good = 0
+    current_bad = 0
+    current_neutral = 0
 
     for _, row in g_sorted.iterrows():
         val = row[group_col]
@@ -185,7 +172,6 @@ def build_timeline(g, group_col):
             val = 'Unknown'
 
         if val != current_val:
-            # On sauvegarde le segment précédent
             if current_val is not None:
                 segments.append({
                     'label': current_val,
@@ -194,13 +180,18 @@ def build_timeline(g, group_col):
                     'gross': current_gross,
                     'aggr_qty': current_aggr_qty,
                     'total_qty': current_total_qty,
+                    'nb_good': current_good,
+                    'nb_bad': current_bad,
+                    'nb_neutral': current_neutral,
                 })
-            # Nouveau segment
             current_val = val
             current_start = row['Exec Timestamp (UTC)']
             current_gross = 0
             current_aggr_qty = 0
             current_total_qty = 0
+            current_good = 0
+            current_bad = 0
+            current_neutral = 0
 
         current_end = row['Exec Timestamp (UTC)']
         current_gross += row['Poids_EUR'] if pd.notna(row['Poids_EUR']) else 0
@@ -209,7 +200,15 @@ def build_timeline(g, group_col):
         if row.get('Aggressive Passive Flag') == 'Aggressive':
             current_aggr_qty += qty
 
-    # Dernier segment
+        pnl = row['P&L Bps vs Mid']
+        if pd.notna(pnl):
+            if pnl > 0:
+                current_good += 1
+            elif pnl < 0:
+                current_bad += 1
+            else:
+                current_neutral += 1
+
     if current_val is not None:
         segments.append({
             'label': current_val,
@@ -218,8 +217,18 @@ def build_timeline(g, group_col):
             'gross': current_gross,
             'aggr_qty': current_aggr_qty,
             'total_qty': current_total_qty,
+            'nb_good': current_good,
+            'nb_bad': current_bad,
+            'nb_neutral': current_neutral,
         })
 
+    return segments
+
+def build_timeline(g, group_col):
+    """Construit une timeline lisible.
+    Format : "Lit 35% [Aggr:30%] (08:12-08:31) → SI 50% [Aggr:95%] (08:31-09:15)"
+    """
+    segments = build_segments(g, group_col)
     total_gross = sum(s['gross'] for s in segments)
     if total_gross == 0:
         return ''
@@ -232,10 +241,143 @@ def build_timeline(g, group_col):
         t_end = s['end'].strftime('%H:%M') if pd.notna(s['end']) else '?'
         parts.append(f"{s['label']} {pct:.0f}% [Aggr:{aggr_pct:.0f}%] ({t_start}-{t_end})")
 
-    return ' → '.join(parts)
+    return ' \u2192 '.join(parts)
 
 # =============================================================================
-# 7. CONSTRUCTION DU DATASET TRADE-LEVEL ENRICHI
+# 7. VISUALISATION TIMELINE D'UN ORDRE
+# Appeler plot_order_timeline(df, order_id) avec un Order Id spécifique.
+# Si order_id=None, ne fait rien.
+# =============================================================================
+
+# Couleurs par type de venue
+VENUE_COLORS = {
+    'SI - Systematic Internaliser': '#e74c3c',  # rouge
+    'Dark': '#2c3e50',                           # bleu foncé
+    'Lit': '#27ae60',                            # vert
+    'Primary Exchange': '#3498db',               # bleu clair
+    'Periodic Auction (Lit)': '#f39c12',         # orange
+    'OTC': '#95a5a6',                            # gris
+    'Unknown': '#bdc3c7',                        # gris clair
+}
+
+# Couleurs par broker (palette auto)
+BROKER_CMAP = plt.cm.get_cmap('tab20')
+
+def plot_order_timeline(df, order_id=None):
+    """Trace la timeline d'un ordre : blocs par venue (haut) et par broker (bas).
+
+    Chaque bloc montre :
+    - Le type de venue ou le broker
+    - Le % du volume (Gross Amount €)
+    - Le ratio d'agressivité
+    - Le ratio Good/Bad fills
+
+    Appeler avec un Order Id valide. Si None, ne fait rien.
+    """
+    if order_id is None:
+        return
+
+    fills = df[df['Order Id'] == order_id].sort_values('Exec Timestamp (UTC)')
+    if len(fills) == 0:
+        print(f"Order Id '{order_id}' non trouvé.")
+        return
+
+    # Infos de l'ordre
+    side = fills['Side'].iloc[0]
+    instrument = fills['Instrument Name'].iloc[0]
+    isin = fills['ISIN'].iloc[0]
+    n_fills = len(fills)
+
+    # Segments venue et broker
+    venue_segs = build_segments(fills, 'Venue Category')
+    broker_segs = build_segments(fills, 'Broker Name')
+
+    # Timestamp de référence = premier fill
+    t0 = fills['Exec Timestamp (UTC)'].min()
+
+    # Durée totale en minutes (au moins 1 min pour affichage)
+    total_duration_min = max((fills['Exec Timestamp (UTC)'].max() - t0).total_seconds() / 60, 1)
+
+    def seg_to_bar(seg, t0):
+        """Convertit un segment en (x_start_min, width_min) depuis t0."""
+        start_min = (seg['start'] - t0).total_seconds() / 60
+        end_min = (seg['end'] - t0).total_seconds() / 60
+        width = max(end_min - start_min, total_duration_min * 0.02)  # largeur min 2% pour visibilité
+        return start_min, width
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
+    fig.suptitle(f"{side} {instrument} ({isin}) — Order {order_id} — {n_fills} fills",
+                 fontsize=13, fontweight='bold')
+
+    total_gross_venue = sum(s['gross'] for s in venue_segs)
+    total_gross_broker = sum(s['gross'] for s in broker_segs)
+
+    # --- Ligne 1 : Blocs par Venue ---
+    for seg in venue_segs:
+        x, w = seg_to_bar(seg, t0)
+        color = VENUE_COLORS.get(seg['label'], '#bdc3c7')
+        ax1.barh(0, w, left=x, height=0.8, color=color, edgecolor='white', linewidth=1.5)
+
+        # Texte dans le bloc
+        pct = seg['gross'] / total_gross_venue * 100 if total_gross_venue > 0 else 0
+        aggr = seg['aggr_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
+        n_seg = seg['nb_good'] + seg['nb_bad'] + seg['nb_neutral']
+        good_r = seg['nb_good'] / n_seg * 100 if n_seg > 0 else 0
+        bad_r = seg['nb_bad'] / n_seg * 100 if n_seg > 0 else 0
+
+        # Label court pour le venue
+        label_short = seg['label'].replace('SI - Systematic Internaliser', 'SI') \
+                                   .replace('Primary Exchange', 'Primary') \
+                                   .replace('Periodic Auction (Lit)', 'Auction')
+
+        txt = f"{label_short}\n{pct:.0f}%\nAggr:{aggr:.0f}%\nG:{good_r:.0f}% B:{bad_r:.0f}%"
+        ax1.text(x + w / 2, 0, txt, ha='center', va='center', fontsize=7,
+                 fontweight='bold', color='white')
+
+    ax1.set_yticks([])
+    ax1.set_ylabel('Venue', fontsize=11, fontweight='bold')
+    ax1.set_ylim(-0.5, 0.5)
+
+    # --- Ligne 2 : Blocs par Broker ---
+    broker_names = list({s['label'] for s in broker_segs})
+    broker_color_map = {name: BROKER_CMAP(i / max(len(broker_names), 1))
+                        for i, name in enumerate(broker_names)}
+
+    for seg in broker_segs:
+        x, w = seg_to_bar(seg, t0)
+        color = broker_color_map.get(seg['label'], '#bdc3c7')
+        ax2.barh(0, w, left=x, height=0.8, color=color, edgecolor='white', linewidth=1.5)
+
+        pct = seg['gross'] / total_gross_broker * 100 if total_gross_broker > 0 else 0
+        aggr = seg['aggr_qty'] / seg['total_qty'] * 100 if seg['total_qty'] > 0 else 0
+        n_seg = seg['nb_good'] + seg['nb_bad'] + seg['nb_neutral']
+        good_r = seg['nb_good'] / n_seg * 100 if n_seg > 0 else 0
+        bad_r = seg['nb_bad'] / n_seg * 100 if n_seg > 0 else 0
+
+        txt = f"{seg['label']}\n{pct:.0f}%\nAggr:{aggr:.0f}%\nG:{good_r:.0f}% B:{bad_r:.0f}%"
+        ax2.text(x + w / 2, 0, txt, ha='center', va='center', fontsize=7,
+                 fontweight='bold', color='white')
+
+    ax2.set_yticks([])
+    ax2.set_ylabel('Broker', fontsize=11, fontweight='bold')
+    ax2.set_ylim(-0.5, 0.5)
+    ax2.set_xlabel('Minutes depuis le 1er fill', fontsize=10)
+
+    # Légende venue
+    venue_patches = [mpatches.Patch(color=c, label=l.replace('SI - Systematic Internaliser', 'SI')
+                                    .replace('Primary Exchange', 'Primary')
+                                    .replace('Periodic Auction (Lit)', 'Auction'))
+                     for l, c in VENUE_COLORS.items()
+                     if any(s['label'] == l for s in venue_segs)]
+    ax1.legend(handles=venue_patches, loc='upper right', fontsize=7, ncol=2)
+
+    plt.tight_layout()
+    plt.savefig(f"timeline_order_{order_id}.png", dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"  Plot sauvé : timeline_order_{order_id}.png")
+
+# =============================================================================
+# 8. CONSTRUCTION DU DATASET TRADE-LEVEL ENRICHI
 # 1 ligne = 1 Order Id, pondéré par Gross Amount € (Poids_EUR)
 # Inclut les timelines venue et broker
 # =============================================================================
@@ -331,14 +473,16 @@ for order_id, g in df.groupby('Order Id'):
     pct_off = (phase_volumes.get('Off_Hours', 0) + phase_volumes.get('Pre_Market', 0) + phase_volumes.get('Post_Market', 0)) / total_poids if total_poids > 0 else 0
 
     # --- Timelines ---
-    # Venue : "Lit 35% [Aggr:30%] (08:12-08:31) → SI 50% [Aggr:95%] (08:31-09:15)"
     timeline_venue = build_timeline(g, 'Venue Category')
-    # Broker : "Citi 60% [Aggr:25%] (08:12-09:00) → MS 40% [Aggr:80%] (09:00-09:28)"
     timeline_broker = build_timeline(g, 'Broker Name')
 
-    # --- PnL contribution : nb de fills good vs bad ---
+    # --- Qualité des fills : ratios Good / Bad / Neutral ---
     nb_good = (g['P&L Bps vs Mid'] > 0).sum()
     nb_bad = (g['P&L Bps vs Mid'] < 0).sum()
+    nb_neutral_fills = n_fills - nb_good - nb_bad
+    good_fill_ratio = nb_good / n_fills if n_fills > 0 else 0
+    bad_fill_ratio = nb_bad / n_fills if n_fills > 0 else 0
+    neutral_fill_ratio = nb_neutral_fills / n_fills if n_fills > 0 else 0
 
     # --- Assemblage ---
     result = {
@@ -402,31 +546,23 @@ for order_id, g in df.groupby('Order Id'):
         'Timeline_Venue': timeline_venue,
         'Timeline_Broker': timeline_broker,
 
-        # Qualité des fills
-        'Nb_Good_Fills': nb_good,
-        'Nb_Bad_Fills': nb_bad,
+        # Qualité des fills (ratios)
+        'Good_Fill_Ratio': good_fill_ratio,
+        'Bad_Fill_Ratio': bad_fill_ratio,
+        'Neutral_Fill_Ratio': neutral_fill_ratio,
     }
     results.append(result)
 
 # =============================================================================
-# 8. EXPORT TRADE-LEVEL
+# 9. ANALYSES DESCRIPTIVES
+# Toutes les moyennes pondérées utilisent Gross Amount € (Poids_EUR)
 # =============================================================================
 
 trade_level = pd.DataFrame(results)
 print(f"\nTrade-level construit : {len(trade_level)} ordres, {len(trade_level.columns)} colonnes")
 
-trade_level.to_excel("trade_level_enriched.xlsx", index=False)
-print("Export trade_level_enriched.xlsx OK")
-
-# =============================================================================
-# 9. ANALYSES DESCRIPTIVES
-# Export dans analyse_descriptive.xlsx (un onglet par analyse)
-# Toutes les moyennes pondérées utilisent Gross Amount € (Poids_EUR)
-# =============================================================================
-
 print("\n=== Analyses descriptives ===")
 
-# Fonction utilitaire globale pour les groupby sur le fill-level
 def wavg_fill(group, col, poids='Poids_EUR'):
     """Moyenne pondérée d'une colonne par Gross Amount €, en ignorant les NaN."""
     valid = group[[col, poids]].dropna()
@@ -445,21 +581,20 @@ cols_stats = [
     'SI_Ratio', 'Dark_Ratio', 'Lit_Ratio',
     'Num_Brokers', 'Broker_Max_Share',
     'Pct_Volume_Continuous', 'Pct_Volume_Auction',
+    'Good_Fill_Ratio', 'Bad_Fill_Ratio', 'Neutral_Fill_Ratio',
 ]
 onglets['Stats_Generales'] = trade_level[cols_stats].describe().T
 print("  Stats générales OK")
 
-# ---- 2. Par broker (pondéré par Gross Amount € + simple) ----
+# ---- 2. Par broker ----
 broker_stats = df.groupby('Broker Name').apply(
     lambda x: pd.Series({
         'Nb_Fills': len(x),
         'Nb_Orders': x['Order Id'].nunique(),
         'Total_Gross_EUR': x['Poids_EUR'].sum(),
-        # Pondéré par Gross Amount €
         'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
         'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
         'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
-        # Non pondéré (pour comparaison)
         'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
         'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
         'Avg_Spread_Capture': x['Spread Capture'].mean(),
@@ -500,6 +635,8 @@ bucket_agg = trade_level.groupby('Bucket_Agressivite', observed=False).agg(
     Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
     Avg_Duration_s=('Duration_Seconds', 'mean'),
     Avg_Num_Fills=('Num_Fills', 'mean'),
+    Avg_Good_Fill_Ratio=('Good_Fill_Ratio', 'mean'),
+    Avg_Bad_Fill_Ratio=('Bad_Fill_Ratio', 'mean'),
 )
 onglets['Par_Bucket_Agressivite'] = bucket_agg
 print("  Par bucket agressivité OK")
@@ -517,6 +654,8 @@ bucket_duree = trade_level.groupby('Bucket_Duree', observed=False).agg(
     Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
     Avg_Aggressive_Ratio=('Aggressive_Ratio', 'mean'),
     Avg_Num_Fills=('Num_Fills', 'mean'),
+    Avg_Good_Fill_Ratio=('Good_Fill_Ratio', 'mean'),
+    Avg_Bad_Fill_Ratio=('Bad_Fill_Ratio', 'mean'),
 )
 onglets['Par_Bucket_Duree'] = bucket_duree
 print("  Par bucket durée OK")
@@ -530,6 +669,8 @@ bucket_venue = trade_level.groupby('Venue_Dominante', observed=False).agg(
     Avg_PnL_Mid=('WAvg_PnL_bps_VS_Mid', 'mean'),
     Avg_Spread_Capture=('WAvg_Spread_Capture_Cont', 'mean'),
     Avg_Aggressive_Ratio=('Aggressive_Ratio', 'mean'),
+    Avg_Good_Fill_Ratio=('Good_Fill_Ratio', 'mean'),
+    Avg_Bad_Fill_Ratio=('Bad_Fill_Ratio', 'mean'),
 ).sort_values('Nb_Ordres', ascending=False)
 onglets['Par_Venue_Dominante'] = bucket_venue
 print("  Par venue dominante OK")
@@ -539,17 +680,13 @@ broker_agg = df.groupby('Broker Name').apply(
     lambda x: pd.Series({
         'Nb_Fills': len(x),
         'Total_Gross_EUR': x['Poids_EUR'].sum(),
-        # Ratios pondérés par Gross Amount €
         'W_Aggressive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Aggressive', 'Poids_EUR'].sum()) / x['Poids_EUR'].sum() if x['Poids_EUR'].sum() > 0 else 0,
         'W_Passive_Ratio': (x.loc[x['Aggressive Passive Flag'] == 'Passive', 'Poids_EUR'].sum()) / x['Poids_EUR'].sum() if x['Poids_EUR'].sum() > 0 else 0,
-        # Ratios simples (en nombre de fills)
         'Aggressive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Aggressive').sum() / len(x),
         'Passive_Ratio_Fills': (x['Aggressive Passive Flag'] == 'Passive').sum() / len(x),
-        # PnL pondéré par Gross Amount €
         'W_PnL_Fartouch': wavg_fill(x, 'P&L Bps vs Fartouch'),
         'W_PnL_Mid': wavg_fill(x, 'P&L Bps vs Mid'),
         'W_Spread_Capture': wavg_fill(x, 'Spread Capture'),
-        # PnL simple
         'Avg_PnL_Fartouch': x['P&L Bps vs Fartouch'].mean(),
         'Avg_PnL_Mid': x['P&L Bps vs Mid'].mean(),
         'Avg_Spread_Capture': x['Spread Capture'].mean(),
@@ -580,13 +717,46 @@ venue_agg = df.groupby('Venue Category').apply(
 onglets['Venue_Agressivite'] = venue_agg
 print("  Venue × Agressivité OK")
 
-# ---- Export multi-onglets ----
-with pd.ExcelWriter("analyse_descriptive.xlsx", engine="openpyxl") as writer:
+# =============================================================================
+# 10. EXPORT UNIQUE — results_TCA_Analysis.xlsx
+# Toutes les feuilles dans un seul fichier
+# =============================================================================
+
+print("\n=== Export final ===")
+with pd.ExcelWriter("results_TCA_Analysis.xlsx", engine="openpyxl") as writer:
+
+    # Feuille 1 : Fills enrichis (1 ligne = 1 fill)
+    cols_export_fill = [
+        'Order Id', 'Fill_Rank', 'Nb_Fills_Ordre',
+        'Exec Timestamp (UTC)', 'Market_Phase',
+        'Side', 'ISIN', 'Instrument Name',
+        'Exec Qty', 'Exec Price', 'Exec Ccy', 'Gross Amount €', 'Poids_EUR',
+        'Venue Category', 'Venue (MIC)', 'Venue Name',
+        'Broker Name', 'Broker Group',
+        'Aggressive Passive Flag',
+        'P&L Bps vs Fartouch', 'P&L Bps vs Mid',
+        'P&L € vs Fartouch', 'P&L € vs Mid',
+        'Spread_Capture_Cont', 'Spread Bps', '% Perf vs Spread',
+        'PnL_Contribution_Mid', 'Fill_Quality',
+    ]
+    cols_export_fill = [c for c in cols_export_fill if c in df.columns]
+    df[cols_export_fill].to_excel(writer, sheet_name='Fills_Enriched', index=False)
+
+    # Feuille 2 : Trade-level enrichi (1 ligne = 1 ordre)
+    trade_level.to_excel(writer, sheet_name='Trade_Level', index=False)
+
+    # Feuilles 3-10 : Analyses descriptives
     for nom_onglet, dataframe in onglets.items():
         dataframe.to_excel(writer, sheet_name=nom_onglet)
 
-print("\nExport analyse_descriptive.xlsx OK (8 onglets)")
-print("\n=== Terminé ===")
-print(f"  - fills_enriched.xlsx       : {len(df)} fills avec rang, contribution PnL, quality flag")
-print(f"  - trade_level_enriched.xlsx : {len(trade_level)} ordres avec timelines venue/broker")
-print(f"  - analyse_descriptive.xlsx  : 8 onglets (pondération Gross Amount €)")
+print(f"Export results_TCA_Analysis.xlsx OK")
+print(f"  - Fills_Enriched  : {len(df)} fills")
+print(f"  - Trade_Level     : {len(trade_level)} ordres")
+print(f"  - + 8 onglets d'analyses descriptives")
+
+# =============================================================================
+# 11. PLOT TIMELINE (optionnel)
+# Décommenter la ligne ci-dessous avec un Order Id pour visualiser un trade
+# =============================================================================
+
+# plot_order_timeline(df, order_id='XXXXXXX')  # <-- Remplacer par un vrai Order Id

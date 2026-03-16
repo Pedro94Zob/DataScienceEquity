@@ -1,0 +1,353 @@
+\documentclass[10pt]{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{booktabs}
+\usepackage{adjustbox}
+\usepackage{amsmath}
+
+\title{Analyse TCA -- Equity Execution FY2025}
+\subtitle{Mid-Study : Pipeline, Variables et Premiers Résultats}
+\author{Pierre BERTHOLD}
+\date{Mars 2026}
+
+\begin{document}
+
+% =============================================
+\begin{frame}
+\titlepage
+\end{frame}
+
+% =============================================
+\begin{frame}{Sommaire}
+\tableofcontents
+\end{frame}
+
+% =============================================
+\section{Contexte et Pipeline}
+
+\begin{frame}{Données et Pipeline}
+\textbf{Source :} Fichier de fills d'exécution (niveau fill) sur FY2025.\\
+Chaque ligne = un fill = une exécution partielle d'un ordre.
+
+\vspace{0.3cm}
+\textbf{Pipeline appliqué :}
+\begin{enumerate}
+    \item \textbf{Chargement} du fichier Excel (89\,142 fills bruts après filtre)
+    \item \textbf{Filtre :} ordres \texttt{(Care OU Market) ET ALGO} uniquement
+    \item \textbf{Nettoyage :} renommage des colonnes dupliquées, conversions numériques et timestamps
+    \item \textbf{Classification} de chaque fill par phase de marché (Continuous / Auction)
+    \item \textbf{Agrégation} au niveau trade : 1 ligne = 1 Order Id (1\,754 ordres)
+    \item \textbf{Analyses descriptives} par broker, venue, agressivité, durée
+\end{enumerate}
+
+\vspace{0.3cm}
+\textbf{Choix méthodologique clé :} toutes les moyennes de performance (PnL, Spread Capture) sont \textbf{pondérées par Exec Qty} (= coût réel par action). Les moyennes simples sont conservées pour comparaison.
+\end{frame}
+
+% =============================================
+\begin{frame}{Phase de marché (Market Phase)}
+Chaque fill est classé selon le moment de son exécution :
+
+\vspace{0.3cm}
+\begin{tabular}{ll}
+\toprule
+\textbf{Phase} & \textbf{Règle de classification} \\
+\midrule
+Auction & Liquidity Indicator Label contient ``Auction'' \\
+Pre\_Market & 7h30--8h00 UTC (hors auction) \\
+Continuous & 8h00--17h00 UTC (hors auction) \\
+Post\_Market & 17h00--17h30 UTC \\
+Off\_Hours & Sinon \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+\textbf{Résultat :} 74\% du volume en Continuous, 26\% en Auction. Aucun fill Off\_Hours.
+
+\vspace{0.3cm}
+\textbf{Pourquoi c'est important :} le Spread Capture et le \% Perf vs Spread n'ont de sens économique que pendant le trading continu (il faut un vrai spread bid-ask). On les calcule donc \textbf{uniquement sur les fills Continuous}.
+\end{frame}
+
+% =============================================
+\section{Variables construites au niveau trade}
+
+\begin{frame}{Variables de contexte et de taille}
+\begin{tabular}{lp{7cm}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+Side & Buy ou Sell (constant par ordre, \texttt{first}) \\
+ISIN / Instrument & Identifiant du titre (constant par ordre) \\
+Area / Quotation Country & Zone géographique du titre \\
+Order\_Qty & Quantité demandée par le PM \\
+Total\_Exec\_Qty & Quantité réellement exécutée (somme des fills) \\
+Num\_Fills & Nombre de fills composant l'ordre \\
+VWAP & Prix moyen pondéré par quantité : $\frac{\sum P_i \times Q_i}{\sum Q_i}$ \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% =============================================
+\begin{frame}{Variables de performance (PnL et Spread)}
+\begin{tabular}{lp{6.5cm}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+WAvg\_PnL\_bps\_VS\_Fartouch & PnL moyen pondéré vs far touch (pire côté du carnet). Mesure conservatrice. \\
+WAvg\_PnL\_bps\_VS\_Mid & PnL moyen pondéré vs mid (milieu du spread). Mesure standard. \\
+WAvg\_Spread\_Capture\_Cont & Part du spread capturée, uniquement sur fills Continuous. 0.5 = mid, 1 = best. \\
+WAvg\_Perf\_vs\_Spread\_Cont & Performance en \% du spread, fills Continuous. \\
+WAvg\_Spread\_Bps\_Cont & Spread moyen pondéré en bps, fills Continuous. \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+\textbf{Formule de la moyenne pondérée :}
+$$\text{WAvg}(X) = \frac{\sum_{i} X_i \times \text{Exec\_Qty}_i}{\sum_{i} \text{Exec\_Qty}_i}$$
+
+Un fill de 10\,000 actions pèse 200$\times$ plus qu'un fill de 50 actions.
+\end{frame}
+
+% =============================================
+\begin{frame}{Variables de timing}
+\begin{tabular}{lp{6.5cm}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+Duration\_Seconds & Temps entre le premier et le dernier fill \\
+Delay\_Placement\_to\_Exec\_s & Délai entre l'envoi de l'ordre et le premier fill \\
+Delay\_Pickup\_to\_Exec\_s & Délai entre la prise en charge broker et le premier fill \\
+Exec\_Intensity\_Qty\_per\_Min & Quantité exécutée par minute ($\frac{Q_{total}}{durée}$) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+\textbf{Constat :} 809 ordres (46\%) sont instantanés (durée = 0s, un seul fill). Ces ordres sont traités séparément dans l'analyse par durée.
+\end{frame}
+
+% =============================================
+\begin{frame}{Variables de microstructure}
+\begin{tabular}{lp{6.5cm}}
+\toprule
+\textbf{Variable} & \textbf{Description} \\
+\midrule
+Aggressive\_Ratio & Part du volume exécuté en mode agressif (prend la liquidité) \\
+Passive\_Ratio & Part du volume exécuté en mode passif (offre la liquidité) \\
+Neutral\_Ratio & Part du volume neutre (auctions principalement) \\
+SI\_Ratio & Part du volume sur Systematic Internaliser \\
+Dark\_Ratio / Lit\_Ratio & Part du volume sur Dark pools / Lit venues \\
+Primary\_Ratio & Part du volume sur la bourse principale \\
+Auction\_Ratio & Part du volume sur Periodic Auctions \\
+Venue\_Count & Nombre de venues MIC distinctes utilisées \\
+Num\_Brokers & Nombre de brokers distincts sur l'ordre \\
+Broker\_Max\_Share & Part du volume du broker dominant \\
+Broker\_HHI & Indice de concentration Herfindahl ($\sum s_i^2$) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.2cm}
+Tous les ratios sont \textbf{pondérés par Exec Qty} (part du volume, pas des fills).
+\end{frame}
+
+% =============================================
+\section{Résultats par onglet}
+
+\begin{frame}{Onglet 1 -- Stats Générales}
+\textbf{Ce que ça fait :} \texttt{describe()} sur les 18 variables clés du trade-level.
+
+\vspace{0.2cm}
+\textbf{Faits marquants :}
+\begin{itemize}
+    \item PnL moyen vs Fartouch : \textbf{+4.4 bps} (globalement positif)
+    \item PnL moyen vs Mid : \textbf{+0.19 bps} (quasi neutre, attendu)
+    \item Spread Capture moyen : \textbf{0.44} (on capte 44\% du spread en moyenne)
+    \item Médiane Aggressive\_Ratio : \textbf{0.31} mais forte dispersion (Q1=0.03, Q3=1.0)
+    \item Médiane SI\_Ratio : \textbf{0.12} mais Q3=1.0 $\rightarrow$ beaucoup d'ordres 100\% SI
+    \item 98\% des ordres n'ont qu'un seul broker (Num\_Brokers médiane = 1)
+\end{itemize}
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 2 -- Par Broker}
+\textbf{Ce que ça fait :} pour chaque broker, calcule le volume total, le PnL pondéré et simple, et le Spread Capture.
+
+\vspace{0.2cm}
+\textbf{Résultats clés (top brokers par volume) :}
+\begin{itemize}
+    \item \textbf{BofA} : meilleur PnL Fartouch pondéré (+8.1 bps), très passif en volume
+    \item \textbf{Citi} : meilleur PnL Mid pondéré (+2.7 bps), meilleur Spread Capture (48\%)
+    \item \textbf{Morgan Stanley} : pire PnL Mid pondéré (--2.1 bps)
+    \item \textbf{Barclays} : Spread Capture pondéré le plus bas (31\%)
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Écart pondéré vs simple :} BofA passe de +5.9 (simple) à +8.1 (pondéré) vs Fartouch $\rightarrow$ ses gros fills performent mieux que ses petits. Barclays passe de 0.51 à 0.31 en Spread Capture $\rightarrow$ ses gros fills capturent mal le spread.
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 3 -- Par Venue Category}
+\textbf{Ce que ça fait :} pour chaque type de venue, calcule volume, PnL et spread (pondéré + simple).
+
+\vspace{0.2cm}
+\textbf{Résultats clés :}
+\begin{itemize}
+    \item \textbf{SI} : PnL Mid pondéré le pire (\textbf{--2.4 bps}), Spread Capture le plus bas (34\%)
+    \item \textbf{Lit} : meilleur PnL global (+7.3 Fartouch, +2.0 Mid), Spread Capture 51\%
+    \item \textbf{Dark} : bon Fartouch (+6.8) mais neutre vs Mid (+0.1)
+    \item \textbf{Primary Exchange} : Spread Capture très bas (19\%) mais spreads serrés (3 bps vs 10--13 ailleurs)
+    \item \textbf{OTC} : flag Aggressive/Passive non renseigné (tout à 0\%)
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Attention :} Primary Exchange a un Spread Capture bas parce que les spreads y sont 3--4$\times$ plus serrés. Le coût absolu y est faible malgré un ratio bas.
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 4 -- Par Bucket d'Agressivité}
+\textbf{Ce que ça fait :} découpe les 1\,754 ordres en 4 groupes selon leur Aggressive\_Ratio (0--25\%, 25--50\%, 50--75\%, 75--100\%).
+
+\vspace{0.2cm}
+\textbf{Résultats :}
+
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{lrrrr}
+\toprule
+Bucket & Nb Ordres & PnL Mid (bps) & Spread Capture & Durée moy. \\
+\midrule
+0--25\% & 820 & +1.6 & 0.55 & 5h43 \\
+25--50\% & 176 & --0.4 & 0.41 & 7h00 \\
+50--75\% & 79 & --1.7 & 0.37 & 6h11 \\
+75--100\% & 679 & --1.1 & 0.36 & 7min47 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+
+\vspace{0.3cm}
+\textbf{Conclusion :} relation monotone claire entre agressivité et coût. Les ordres très agressifs sont aussi beaucoup plus courts (8 min vs 6h), ce qui suggère un lien agressivité--durée--venue (SI).
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 5 -- Par Bucket de Durée}
+\textbf{Ce que ça fait :} découpe les ordres en 5 buckets de durée (0s, <1min, 1--10min, 10--60min, >1h).
+
+\vspace{0.2cm}
+\textbf{Résultats :}
+
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{lrrrrr}
+\toprule
+Bucket & Nb Ordres & PnL Fartouch & PnL Mid & Spread Capt. & Aggr. Ratio \\
+\midrule
+Instantané (0s) & 809 & +2.5 & --0.7 & 0.39 & 0.74 \\
+Très court (<1min) & 200 & +2.7 & --0.5 & 0.39 & 0.41 \\
+Court (1--10min) & 207 & +5.8 & +2.4 & 0.50 & 0.24 \\
+Moyen (10--60min) & 200 & +5.3 & +0.3 & 0.51 & 0.23 \\
+Long (>1h) & 338 & +8.8 & +1.3 & 0.52 & 0.17 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+
+\vspace{0.3cm}
+\textbf{Conclusion :} les ordres longs performent mieux sur toutes les métriques. Mais ils sont aussi les moins agressifs. La durée est-elle un facteur en soi, ou est-ce un proxy de la passivité ?
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 6 -- Par Venue Dominante}
+\textbf{Ce que ça fait :} identifie le type de venue ayant reçu le plus de volume pour chaque ordre, puis compare les performances.
+
+\vspace{0.2cm}
+\textbf{Résultats :}
+
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{lrrrrr}
+\toprule
+Venue Dom. & Nb Ordres & PnL Fartouch & PnL Mid & Spread Capt. & Aggr. Ratio \\
+\midrule
+SI & 733 & +2.6 & --1.2 & 0.38 & 0.87 \\
+Primary & 343 & +3.9 & +1.4 & 0.56 & 0.10 \\
+Auction & 301 & +7.7 & +1.5 & 0.50 & 0.11 \\
+Dark & 187 & +7.0 & +0.2 & 0.48 & 0.23 \\
+Lit & 186 & +5.1 & +1.3 & 0.47 & 0.44 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+
+\vspace{0.3cm}
+\textbf{Conclusion :} les ordres à dominante SI sont les plus nombreux (733) et les moins performants vs Mid. Ils sont aussi massivement agressifs (87\%). Le SI concentre le problème agressivité--coût.
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 7 -- Broker $\times$ Agressivité}
+\textbf{Ce que ça fait :} pour chaque broker, calcule le taux d'agressivité pondéré par volume et le met en face du PnL pondéré. Permet de répondre à : \textit{``ce broker est-il cher parce qu'il est agressif ?''}
+
+\vspace{0.2cm}
+\textbf{Résultats clés :}
+\begin{itemize}
+    \item \textbf{Goldman Sachs} : le plus agressif en volume (53\%), PnL Mid --0.4 bps
+    \item \textbf{BofA} : le moins agressif (12\%), le plus passif (52\%), meilleur PnL Fartouch (+8.1)
+    \item \textbf{Citi} : équilibré (34\% agressif / 37\% passif), meilleur PnL Mid (+2.7)
+    \item \textbf{Morgan Stanley} : 30\% agressif, pire PnL Mid (--2.1) $\rightarrow$ mauvaise performance non expliquée par l'agressivité seule
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Question ouverte :} Morgan Stanley n'est pas le plus agressif mais performe le moins bien. D'autres facteurs (taille des ordres, liquidité des titres, timing) pourraient expliquer l'écart.
+\end{frame}
+
+% =============================================
+\begin{frame}{Onglet 8 -- Venue $\times$ Agressivité}
+\textbf{Ce que ça fait :} pour chaque type de venue, calcule le taux d'agressivité pondéré et le PnL associé. Permet de voir si certaines venues \textit{forcent} un style d'exécution.
+
+\vspace{0.2cm}
+\textbf{Résultats clés :}
+\begin{itemize}
+    \item \textbf{SI} : 86\% du volume est agressif $\rightarrow$ le SI ``force'' l'agressivité
+    \item \textbf{Periodic Auction} : 99\% neutre (logique, c'est une auction)
+    \item \textbf{Dark} : 74\% passif $\rightarrow$ le dark ``force'' la passivité
+    \item \textbf{Lit} : 56\% passif, 43\% agressif $\rightarrow$ le plus équilibré
+    \item \textbf{OTC} : aucun flag renseigné (données manquantes)
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Conclusion :} le type de venue détermine largement le style d'exécution. Le choix de venue est donc un levier direct sur le coût.
+\end{frame}
+
+% =============================================
+\section{Synthèse et Prochaines Étapes}
+
+\begin{frame}{Synthèse des résultats}
+\textbf{3 résultats principaux :}
+
+\begin{enumerate}
+    \item \textbf{L'agressivité coûte :} relation monotone entre Aggressive\_Ratio et dégradation du PnL Mid / Spread Capture
+    \item \textbf{Le SI concentre le problème :} 42\% du volume y passe, avec 86\% d'agressivité et le pire PnL Mid (--2.4 bps)
+    \item \textbf{Les brokers ne sont pas équivalents :} à volume comparable, écarts de 4+ bps en PnL Fartouch pondéré, pas entièrement expliqués par le style d'exécution
+\end{enumerate}
+
+\vspace{0.3cm}
+\textbf{Limites actuelles :}
+\begin{itemize}
+    \item Pas de contrôle par taille d'ordre (\% ADV) $\rightarrow$ biais possible (brokers sur ordres faciles vs difficiles)
+    \item Pas d'analyse temporelle (mois, tendance)
+    \item Corrélations venue--agressivité--durée non démêlées
+\end{itemize}
+\end{frame}
+
+% =============================================
+\begin{frame}{Prochaines étapes}
+\textbf{Phase 4 -- Analyses avancées :}
+
+\begin{enumerate}
+    \item \textbf{Contrôle par taille :} croiser les analyses par bucket de \% ADV pour vérifier si les écarts brokers persistent à taille d'ordre comparable
+    \item \textbf{Régression multivariée :} modèle PnL Mid $\sim$ Aggressive\_Ratio + SI\_Ratio + Duration + \% ADV + Broker pour isoler l'effet propre de chaque facteur
+    \item \textbf{Analyse momentum / reversion :} ajouter le rendement du titre sur la journée pour distinguer les ordres dans le sens du marché (momentum) vs contre (reversion)
+    \item \textbf{Dataset broker-level :} créer une table où chaque ligne = participation d'un broker dans un ordre, pour analyser finement le multi-broker
+\end{enumerate}
+
+\vspace{0.3cm}
+\textbf{Objectif final :} identifier les leviers actionnables (choix de broker, de venue, niveau d'agressivité cible) pour améliorer structurellement la qualité d'exécution.
+\end{frame}
+
+\end{document}
